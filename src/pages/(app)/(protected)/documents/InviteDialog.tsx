@@ -1,0 +1,354 @@
+import { useMemo, useState } from 'react'
+import type { RecordData } from 'deepspace'
+import { useMutations, useUser, useUserLookup } from 'deepspace'
+import { Mail, ShieldCheck, UserMinus, Users } from 'lucide-react'
+import { Modal, useToast } from '@/components/ui'
+import {
+  parseDocumentsIdList,
+  type DocumentsDocumentFields,
+  type InviteAclDiff,
+} from './documents-library-types'
+import { findDocumentsInvitee } from './documents-invitee-lookup'
+import type { DocumentsInviteeLookup } from '@/actions/documents-find-invitee'
+
+/** One row of "People with access", drawn from the roster every member receives. */
+interface PersonRow {
+  id: string
+  name: string
+  /** Only admins receive emails in the roster. */
+  email?: string
+  imageUrl?: string
+}
+
+type InviteRole = 'viewer' | 'editor'
+
+interface InviteDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  doc: RecordData<DocumentsDocumentFields>
+  isOwner: boolean
+  /**
+   * Called after a save mutation that changed the ACL. The parent uses it to
+   * publish a one-shot permission-change signal over the doc's presence room
+   * so peers (including ones who just lost read access to the doc record)
+   * can react immediately instead of waiting for the next refresh.
+   */
+  onAclChange?: (diff: InviteAclDiff) => void
+}
+
+function uniqueIds(ids: string[]): string[] {
+  return [...new Set(ids.filter(Boolean))]
+}
+
+function initialsFor(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return '?'
+  return parts
+    .slice(0, 2)
+    .map((p) => p[0]?.toUpperCase() ?? '')
+    .join('')
+}
+
+export function InviteDialog({ open, onOpenChange, doc, isOwner, onAclChange }: InviteDialogProps) {
+  const { user } = useUser()
+  // The roster names everyone who has signed in to the app, projected to
+  // public identity for members. A plain `useQuery('users')` is self-only
+  // under the scaffold's `member: { read: 'own' }` policy, so it cannot name
+  // a collaborator — or resolve an email — for an ordinary owner.
+  const { getUser } = useUserLookup()
+  const { putConfirmed, ready: documentsMutationsReady } =
+    useMutations<DocumentsDocumentFields>('documents')
+  const toast = useToast()
+  const [email, setEmail] = useState('')
+  const [role, setRole] = useState<InviteRole>('editor')
+  const [saving, setSaving] = useState(false)
+  const ready = documentsMutationsReady
+
+  const collaborators = useMemo(
+    () => parseDocumentsIdList(doc.data.collaborators),
+    [doc.data.collaborators],
+  )
+  const editors = useMemo(() => parseDocumentsIdList(doc.data.editors), [doc.data.editors])
+
+  const ownerRecord = useMemo(() => getUser(doc.data.ownerId), [doc.data.ownerId, getUser])
+
+  // Every collaborator id stays listed even before the roster names it, so
+  // access can always be changed or removed.
+  const collaboratorRecords = useMemo<PersonRow[]>(
+    () =>
+      collaborators.map((id) => {
+        const u = getUser(id)
+        return {
+          id,
+          name: u?.name?.trim() || 'Collaborator',
+          email: u?.email,
+          imageUrl: u?.imageUrl,
+        }
+      }),
+    [collaborators, getUser],
+  )
+
+  if (!isOwner) return null
+
+  const saveAccess = async (
+    nextCollaborators: string[],
+    nextEditors: string[],
+  ): Promise<boolean> => {
+    if (!ready) return false
+    const prevCollaborators = parseDocumentsIdList(doc.data.collaborators)
+    const prevEditors = parseDocumentsIdList(doc.data.editors)
+    const nextCollabList = uniqueIds(nextCollaborators)
+    const nextCollabSet = new Set(nextCollabList)
+    const nextEditorList = uniqueIds(nextEditors).filter((id) => nextCollabSet.has(id))
+    const nextEditorSet = new Set(nextEditorList)
+
+    setSaving(true)
+    try {
+      await putConfirmed(doc.recordId, {
+        ...doc.data,
+        collaborators: JSON.stringify(nextCollabList),
+        editors: JSON.stringify(nextEditorList),
+      })
+
+      if (onAclChange) {
+        const removedUserIds = prevCollaborators.filter((id) => !nextCollabSet.has(id))
+        const demotedUserIds = prevEditors.filter(
+          (id) => nextCollabSet.has(id) && !nextEditorSet.has(id),
+        )
+        const promotedUserIds = nextEditorList.filter(
+          (id) => prevCollaborators.includes(id) && !prevEditors.includes(id),
+        )
+        if (removedUserIds.length || demotedUserIds.length || promotedUserIds.length) {
+          onAclChange({ removedUserIds, demotedUserIds, promotedUserIds })
+        }
+      }
+      return true
+    } catch {
+      toast.error(
+        'Access not saved',
+        'DeepSpace did not confirm the change. Reconnect and try again.',
+      )
+      return false
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const addInvite = async () => {
+    const normalized = email.trim().toLowerCase()
+    if (!normalized || !ready) return
+
+    // The email resolves server-side (owner-only action): members cannot read
+    // other users' rows, and the roster carries no emails for them.
+    let target: DocumentsInviteeLookup
+    setSaving(true)
+    try {
+      target = await findDocumentsInvitee(doc.recordId, normalized)
+    } catch (err) {
+      toast.error('Could not look up that email', err instanceof Error ? err.message : undefined)
+      return
+    } finally {
+      setSaving(false)
+    }
+    if (!target.found) {
+      toast.error(
+        'User not found',
+        'Ask them to sign in to this app once, then invite the same email again.',
+      )
+      return
+    }
+    if (target.userId === doc.data.ownerId || target.userId === user?.id) {
+      toast.info('Already has access', 'That user is the document owner.')
+      return
+    }
+    if (collaborators.includes(target.userId)) {
+      toast.info('Already invited', `${normalized} already has access.`)
+      return
+    }
+
+    const nextCollaborators = [...collaborators, target.userId]
+    const nextEditors = role === 'editor' ? [...editors, target.userId] : editors
+    if (!(await saveAccess(nextCollaborators, nextEditors))) return
+    setEmail('')
+    toast.success('Invite added', `${normalized} now has ${role} access.`)
+  }
+
+  const setCollaboratorRole = async (userId: string, nextRole: InviteRole) => {
+    const nextEditors =
+      nextRole === 'editor'
+        ? uniqueIds([...editors, userId])
+        : editors.filter((id) => id !== userId)
+    await saveAccess(collaborators, nextEditors)
+  }
+
+  const removeCollaborator = async (userId: string) => {
+    await saveAccess(
+      collaborators.filter((id) => id !== userId),
+      editors.filter((id) => id !== userId),
+    )
+  }
+
+  const ownerName = ownerRecord?.name?.trim() || user?.name || user?.email || 'Owner'
+
+  return (
+    <Modal
+      open={open}
+      onClose={() => onOpenChange(false)}
+      size="lg"
+      className="documents-feature-scope"
+    >
+      <Modal.Header>
+        <Modal.Title>Share document</Modal.Title>
+        <Modal.Description>
+          Invite DeepSpace users by the email address on their account.
+        </Modal.Description>
+      </Modal.Header>
+
+      <Modal.Body className="space-y-5">
+        <div className="rounded-xl border p-3" style={{ borderColor: 'var(--documents-el-line)' }}>
+          <label
+            className="mb-2 block text-xs font-semibold uppercase tracking-wide"
+            style={{ color: 'var(--documents-el-muted)' }}
+          >
+            Add people
+          </label>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <div className="relative min-w-0 flex-1">
+              <Mail
+                className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2"
+                style={{ color: 'var(--documents-el-muted)' }}
+              />
+              <input
+                disabled={!ready || saving}
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void addInvite()
+                }}
+                placeholder="person@gmail.com"
+                className="h-10 w-full rounded-lg border bg-transparent pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                style={{
+                  borderColor: 'var(--documents-el-line)',
+                  color: 'var(--documents-el-text)',
+                }}
+              />
+            </div>
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value as InviteRole)}
+              // addInvite grants the role captured when Add was pressed; lock
+              // the select while the lookup and save run so the UI cannot show
+              // one role and grant another.
+              disabled={!ready || saving}
+              className="h-10 rounded-lg border bg-transparent px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+              style={{ borderColor: 'var(--documents-el-line)', color: 'var(--documents-el-text)' }}
+            >
+              <option value="editor">Editor</option>
+              <option value="viewer">Viewer</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => void addInvite()}
+              disabled={!ready || saving || !email.trim()}
+              className="h-10 rounded-lg px-4 text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              style={{ backgroundColor: 'var(--documents-el-accent)' }}
+            >
+              Add
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <div className="mb-3 flex items-center gap-2">
+            <Users className="h-4 w-4" style={{ color: 'var(--documents-el-muted)' }} />
+            <h3 className="text-sm font-semibold">People with access</h3>
+          </div>
+
+          <div className="space-y-2">
+            <div
+              className="flex items-center gap-3 rounded-xl border p-3"
+              style={{ borderColor: 'var(--documents-el-line)' }}
+            >
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-black/5 text-xs font-bold dark:bg-white/10">
+                {initialsFor(ownerName)}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-medium">{ownerName}</div>
+                <div className="truncate text-xs" style={{ color: 'var(--documents-el-muted)' }}>
+                  {ownerRecord?.email ?? user?.email ?? 'Owner'}
+                </div>
+              </div>
+              <span className="inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium">
+                <ShieldCheck className="h-3.5 w-3.5" />
+                Owner
+              </span>
+            </div>
+
+            {collaboratorRecords.map((u) => {
+              const userRole: InviteRole = editors.includes(u.id) ? 'editor' : 'viewer'
+              return (
+                <div
+                  key={u.id}
+                  className="flex items-center gap-3 rounded-xl border p-3"
+                  style={{ borderColor: 'var(--documents-el-line)' }}
+                >
+                  {u.imageUrl ? (
+                    <img
+                      src={u.imageUrl}
+                      alt=""
+                      className="h-9 w-9 shrink-0 rounded-full object-cover"
+                    />
+                  ) : (
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-black/5 text-xs font-bold dark:bg-white/10">
+                      {initialsFor(u.name)}
+                    </div>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium">{u.name}</div>
+                    <div
+                      className="truncate text-xs"
+                      style={{ color: 'var(--documents-el-muted)' }}
+                    >
+                      {u.email ?? (userRole === 'editor' ? 'Can edit' : 'Can view')}
+                    </div>
+                  </div>
+                  <select
+                    value={userRole}
+                    onChange={(e) => void setCollaboratorRole(u.id, e.target.value as InviteRole)}
+                    disabled={!ready || saving}
+                    className="h-8 rounded-lg border bg-transparent px-2 text-xs font-medium outline-none"
+                    style={{
+                      borderColor: 'var(--documents-el-line)',
+                      color: 'var(--documents-el-text)',
+                    }}
+                  >
+                    <option value="editor">Editor</option>
+                    <option value="viewer">Viewer</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => void removeCollaborator(u.id)}
+                    disabled={!ready || saving}
+                    className="rounded-lg p-1.5 text-red-600 transition-colors hover:bg-red-500/10 disabled:opacity-50"
+                    title="Remove access"
+                  >
+                    <UserMinus className="h-4 w-4" />
+                  </button>
+                </div>
+              )
+            })}
+
+            {collaboratorRecords.length === 0 ? (
+              <p
+                className="rounded-xl border p-3 text-sm"
+                style={{ color: 'var(--documents-el-muted)' }}
+              >
+                Only the owner can access this document.
+              </p>
+            ) : null}
+          </div>
+        </div>
+      </Modal.Body>
+    </Modal>
+  )
+}
